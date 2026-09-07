@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] nixos support and remote DNS proxy restoration
+
+1. Bypass vcpkg CMake integration and link dynamically to system libraries.
+2. Permit helper binary resolution when /opt/windscribe is a store symlink.
+3. Preserve Nix Qt platform/theme plugin search paths in main().
+4. Restore SOCKS5 proxy options and use socks5h:// to bypass DNS poisoning.
+---
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index db7cd90..6f2b8b4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -122,9 +122,7 @@ endif()
+ # ------------------------------------------------------------------------------
+ 
+ # vcpkg integration (only needed for build operations, must be before project())
+-if(BUILD_APP OR BUILD_INSTALLER OR BUILD_BOOTSTRAP)
+-    include(cmake/vcpkg.cmake)
+-endif()
++# vcpkg disabled for Nix
+ 
+ project(WS LANGUAGES CXX C)
+ 
+@@ -135,9 +133,7 @@ project(WS LANGUAGES CXX C)
+ # wsnet ahead of the install only fails on CI.  The macro depends solely on state established before
+ # project() (VCPKG_ROOT, VCPKG_TARGET_TRIPLET, CMAKE_BUILD_TYPE, the manifest root), so hoisting it
+ # here is safe.
+-if(BUILD_APP OR BUILD_INSTALLER OR BUILD_BOOTSTRAP)
+-    install_vcpkg_dependencies()
+-endif()
++# vcpkg install disabled for Nix
+ 
+ # Fetch wsnet here, in a pristine directory scope, BEFORE any project-wide compile/link options
+ # exist: the Objective-C ARC option and the Windows hardening flags below, the AUTOMOC/AUTOUIC/
+@@ -213,13 +209,13 @@ endif()
+ # leaving VCPKG_ROOT unset. Defined only here so an unguarded use fails to compile rather than
+ # silently getting "".
+ if(BUILD_APP)
+-    ws_resolve_openvpn_version(WS_OPENVPN_VERSION)
++    set(WS_OPENVPN_VERSION "2.7.5")
+     add_compile_definitions(WS_OPENVPN_VERSION="${WS_OPENVPN_VERSION}")
+ 
+     # Resolved here rather than next to ws_resolve_shared_libs() below, because the names are needed
+     # by the branding definitions that follow and by the subdirectories those definitions reach.
+     if(NOT WIN32)
+-        ws_resolve_openssl_libs()
++        # ws_resolve_openssl_libs skipped
+         if(APPLE)
+             # Not in the branding block below: the value is platform-specific, so a WS_MAC_ name must
+             # not be defined anywhere it would hold something other than the macOS one.
+@@ -342,8 +338,10 @@ if(NOT EXISTS "${WINDSCRIBE_BUILD_LIBS_PATH}")
+ endif()
+ 
+ # ------------------------------------------------------------------------------
+-ws_resolve_bundled_helpers()
+-ws_resolve_shared_libs()
++if(BUILD_INSTALLER)
++    ws_resolve_bundled_helpers()
++    ws_resolve_shared_libs()
++endif()
+ 
+ # ------------------------------------------------------------------------------
+ # Code Signing Configuration
+diff --git a/cmake/fetch_wsnet.cmake b/cmake/fetch_wsnet.cmake
+index 11afc32..d04e584 100644
+--- a/cmake/fetch_wsnet.cmake
++++ b/cmake/fetch_wsnet.cmake
+@@ -1,9 +1,8 @@
+ if(NOT TARGET wsnet::wsnet)
+-    include(FetchContent)
+-    FetchContent_Declare(wsnet
+-        GIT_REPOSITORY https://github.com/Windscribe/wsnet.git
+-        GIT_TAG        1.5.32
++    add_library(wsnet SHARED IMPORTED GLOBAL)
++    set_target_properties(wsnet PROPERTIES
++        IMPORTED_LOCATION "${WSNET_DIR}/lib/libwsnet.so"
++        INTERFACE_INCLUDE_DIRECTORIES "${WSNET_DIR}/include;${WSNET_DIR}/include/wsnet_internal"
+     )
+-    set(IS_BUILD_TESTS OFF)
+-    FetchContent_MakeAvailable(wsnet)
++    add_library(wsnet::wsnet ALIAS wsnet)
+ endif()
+diff --git a/src/client/CMakeLists.txt b/src/client/CMakeLists.txt
+index cada3aa..e21d1ee 100644
+--- a/src/client/CMakeLists.txt
++++ b/src/client/CMakeLists.txt
+@@ -183,7 +183,7 @@ if (WIN32)
+     target_link_options(${WS_APP_TARGET} PRIVATE "/IGNORE:4099")
+ endif()
+ 
+-target_link_libraries(${WS_APP_TARGET} PRIVATE ${FRONTEND_TYPE} frontend-common ${WS_CLIENT_EXTRA_LIBS} engine client-common wsnet::wsnet spdlog::spdlog Qt6::Network ${OS_SPECIFIC_LIBRARIES})
++target_link_libraries(${WS_APP_TARGET} PRIVATE ${FRONTEND_TYPE} frontend-common ${WS_CLIENT_EXTRA_LIBS} engine client-common wsnet::wsnet cares spdlog::spdlog Qt6::Network ${OS_SPECIFIC_LIBRARIES})
+ 
+ if (UNIX AND (NOT APPLE))
+     qt_import_plugins(${WS_APP_TARGET} INCLUDE Qt6::QWaylandIntegrationPlugin Qt6::QXcbIntegrationPlugin)
+diff --git a/src/client/client-common/types/proxysettings.cpp b/src/client/client-common/types/proxysettings.cpp
+index 28e932b..bb12480 100644
+--- a/src/client/client-common/types/proxysettings.cpp
++++ b/src/client/client-common/types/proxysettings.cpp
+@@ -94,7 +94,7 @@ QString ProxySettings::curlAddress() const
+     if (option_ == PROXY_OPTION_HTTP)
+         return "http://" + address_ + ":" + QString::number(port_);
+     else if (option_ == PROXY_OPTION_SOCKS)
+-        return "socks5://" + address_ + ":" + QString::number(port_);
++        return "socks5h://" + address_ + ":" + QString::number(port_);
+     else
+         return "";
+ }
+@@ -185,13 +185,13 @@ bool ProxySettings::isProxyEnabled() const
+ void ProxySettings::validate()
+ {
+     option_ = enumFromInt<PROXY_OPTION>(static_cast<int>(option_));
+-    if (option_ == PROXY_OPTION_AUTODETECT || option_ == PROXY_OPTION_SOCKS) {
++    if (option_ == PROXY_OPTION_AUTODETECT) {
+         qCWarning(LOG_BASIC) << "ProxySettings: unsupported proxy option, resetting";
+         option_ = PROXY_OPTION_NONE;
+     }
+ 
+     bool needsReset = false;
+-    if (option_ == PROXY_OPTION_HTTP) {
+-        if (!NetworkingValidation::isIp(address_)) {
++    if (option_ == PROXY_OPTION_HTTP || option_ == PROXY_OPTION_SOCKS) {
++        if (!NetworkingValidation::isIpOrDomain(address_)) {
+             qCWarning(LOG_BASIC) << "ProxySettings: invalid address, disabling proxy";
+             needsReset = true;
+         } else if (!NetworkingValidation::isValidPort(static_cast<int>(port_))) {
+diff --git a/src/client/frontend/gui/main.cpp b/src/client/frontend/gui/main.cpp
+index b32ddf7..b095b52 100644
+--- a/src/client/frontend/gui/main.cpp
++++ b/src/client/frontend/gui/main.cpp
+@@ -170,7 +170,7 @@ int main(int argc, char *argv[])
+         }
+         QStringList pluginsPath;
+         pluginsPath << QString::fromStdString(path) + "/plugins";
+-        QCoreApplication::setLibraryPaths(pluginsPath);
++        QCoreApplication::addLibraryPath(QString::fromStdString(path) + "/plugins");
+     #endif
+ #endif
+ 
+@@ -180,7 +180,7 @@ int main(int argc, char *argv[])
+     // Must precede the gid drop: some loaders (e.g. Mesa) re-honor these once egid == gid.
+     // GL is disabled (pure Widgets, no GL context); QT_QPA_PLATFORM_PLUGIN_PATH is read separately
+     // from setLibraryPaths above, so unset it to keep the platform plugin in the bundled dir.
+-    if (!qputenv("QT_XCB_GL_INTEGRATION", "none") || !qunsetenv("QT_QPA_PLATFORM_PLUGIN_PATH")) {
++    if (!qputenv("QT_XCB_GL_INTEGRATION", "none")) {
+         qCCritical(LOG_BASIC) << "Could not neutralize environment";
+         return -1;
+     }
+diff --git a/src/client/frontend/gui/preferenceswindow/proxysettingswindow/proxysettingsgroup.cpp b/src/client/frontend/gui/preferenceswindow/proxysettingswindow/proxysettingsgroup.cpp
+index cfa7489..e939fa1 100644
+--- a/src/client/frontend/gui/preferenceswindow/proxysettingswindow/proxysettingsgroup.cpp
++++ b/src/client/frontend/gui/preferenceswindow/proxysettingswindow/proxysettingsgroup.cpp
+@@ -11,8 +11,7 @@ namespace PreferencesWindow {
+ 
+ static bool IsProxyOptionAllowed(int option_number) {
+     // Temporarily hide Auto-detect and SOCKS proxy options in the GUI.
+-    return option_number != PROXY_OPTION_AUTODETECT &&
+-           option_number != PROXY_OPTION_SOCKS;
++    return option_number != PROXY_OPTION_AUTODETECT;
+ }
+ 
+ ProxySettingsGroup::ProxySettingsGroup(ScalableGraphicsObject *parent, const QString &desc, const QString &descUrl)
+diff --git a/src/helper/linux/split_tunneling/hostnames_manager/dns_resolver.h b/src/helper/linux/split_tunneling/hostnames_manager/dns_resolver.h
+index 7df7fa0..891c208 100644
+--- a/src/helper/linux/split_tunneling/hostnames_manager/dns_resolver.h
++++ b/src/helper/linux/split_tunneling/hostnames_manager/dns_resolver.h
+@@ -5,6 +5,7 @@
+ #include <optional>
+ #include <wsnet/WSNet.h>
+ #include <boost/asio.hpp>
++#include <boost/asio/deadline_timer.hpp>
+ 
+ // measuring time in ms helper
+ template <
+diff --git a/src/helper/linux/utils.cpp b/src/helper/linux/utils.cpp
+index f9c6ac2..629f776 100644
+--- a/src/helper/linux/utils.cpp
++++ b/src/helper/linux/utils.cpp
+@@ -102,12 +102,16 @@ bool resolveExePath(const std::string &exePath, const std::string &executable, s
+ 
+ // check only for non-dev builds
+ #ifndef WINDSCRIBE_DEV_MODE
+-    if (strcmp(canonicalPath, WS_LINUX_INSTALL_DIR) != 0 && strcmp(canonicalPath, "/usr/lib" WS_LINUX_INSTALL_DIR) != 0) {
+-        // Don't execute arbitrary commands, only executables that are in our application directory
+-        spdlog::warn("Executable not in correct path, ignoring.");
+-        free(canonicalPath);
+-        return false;
+-    }
++    char *expectedCanonical = realpath(WS_LINUX_INSTALL_DIR, NULL);
++    bool valid = (strcmp(canonicalPath, WS_LINUX_INSTALL_DIR) == 0) ||
++                 (strcmp(canonicalPath, "/usr/lib" WS_LINUX_INSTALL_DIR) == 0) ||
++                 (expectedCanonical && strcmp(canonicalPath, expectedCanonical) == 0);
++    if (expectedCanonical) free(expectedCanonical);
++    if (!valid) {
++        spdlog::warn("Executable not in correct path, ignoring: {}", canonicalPath);
++        free(canonicalPath);
++        return false;
++    }
+ #endif
+ 
+     outPath = std::string(canonicalPath) + "/" + executable;
